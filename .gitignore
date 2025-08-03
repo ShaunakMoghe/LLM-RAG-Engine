@@ -1,0 +1,20 @@
+# Python / Backend
+/backend/venv/
+/backend/__pycache__/
+/backend/datasets/
+/backend/fine_tuned_phi2/
+/backend/unsloth_compiled_cache/
+
+# Node.js / Frontend
+/frontend/node_modules/
+/frontend/.next/
+/frontend/out/
+
+# IDE / OS specific
+.vscode/
+.DS_Store
+
+# Environment variables
+.env
+*.env.*
+!*.env.example
