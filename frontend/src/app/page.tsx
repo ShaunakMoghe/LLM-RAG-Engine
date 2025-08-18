@@ -1,42 +1,114 @@
 "use client";
-import { useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 
-// Defines the structure for each message in our chat history
-type ChatMessage = {
-  role: "user" | "model";
-  content: string;
+type ChatMessage =
+  | { role: "user"; content: string }
+  | {
+      role: "model";
+      content: string;
+      sources?: Array<{ doc_id: string; page: number; source: string }>;
+    };
+
+type DocInfo = {
+  doc_id: string;
+  filename: string;
+  pages: number;
+  chunk_count: number;
+  uploaded_at: string;
 };
 
+function groupSources(
+  sources?: Array<{ doc_id: string; page: number; source: string }>
+) {
+  if (!sources || sources.length === 0) return [];
+  const byFile: Record<string, number[]> = {};
+  for (const s of sources) {
+    const key = s.source || "unknown";
+    (byFile[key] ||= []).push(s.page);
+  }
+  return Object.entries(byFile).map(([file, pages]) => ({
+    file,
+    pages: Array.from(new Set(pages)).sort((a, b) => a - b),
+  }));
+}
+
 export default function Home() {
-  // State for the upload and train process
+  // Upload state
   const [file, setFile] = useState<File | null>(null);
-  const [uploadStatus, setUploadStatus] = useState("");
-  const [trainStatus, setTrainStatus] = useState("");
-  const [uploadedFilename, setUploadedFilename] = useState("");
+  const [uploadStatus, setUploadStatus] = useState<string>("");
+  const [isUploading, setIsUploading] = useState<boolean>(false);
 
-  // State for the new chat interface
-  const [message, setMessage] = useState("");
+  // Docs / Library
+  const [docs, setDocs] = useState<DocInfo[]>([]);
+  const [selectedDocIds, setSelectedDocIds] = useState<string[]>([]); // empty = all
+  const [isIndexing, setIsIndexing] = useState<boolean>(false);
+
+  // Chat state
+  const [message, setMessage] = useState<string>("");
   const [chatHistory, setChatHistory] = useState<ChatMessage[]>([]);
-  const [isChatting, setIsChatting] = useState(false);
+  const [isChatting, setIsChatting] = useState<boolean>(false);
 
-  // --- Dynamic Backend URL ---
-  // Connects to the backend using the browser's current hostname
-  const backendHost = typeof window !== 'undefined' ? window.location.hostname : 'localhost';
-  const backendUrl = `http://${backendHost}:8000`;
+  // Status
+  const [error, setError] = useState<string>("");
+  const [banner, setBanner] = useState<string>("");
+  const [toast, setToast] = useState<string>("");
+
+  // Backend URL (same host convenience)
+  const backendHost =
+    typeof window !== "undefined" ? window.location.hostname : "localhost";
+  const backendUrl = useMemo(() => `http://${backendHost}:8000`, [backendHost]);
+
+  // Refs
+  const chatBottomRef = useRef<HTMLDivElement | null>(null);
+
+  useEffect(() => {
+    chatBottomRef.current?.scrollIntoView({ behavior: "smooth" });
+  }, [chatHistory, isChatting]);
+
+  // Fetch docs on load
+  useEffect(() => {
+    void fetchDocs();
+  }, []);
+
+  const fetchDocs = async () => {
+    try {
+      const res = await fetch(`${backendUrl}/docs`, { cache: "no-store" });
+      if (!res.ok) throw new Error(`HTTP ${res.status}`);
+      const data = await res.json();
+      setDocs(data?.docs || []);
+    } catch (e) {
+      console.error("GET /docs failed:", e);
+      setDocs([]);        // show 0, but now you’ll see the error in the console
+    }
+  };
 
 
+  const resetForNewUpload = () => {
+    setChatHistory([]);
+    setUploadStatus("");
+    setError("");
+    setBanner("");
+  };
+
+  const handleFileInput = (f: File | null) => {
+    setFile(f);
+    if (f) resetForNewUpload();
+  };
+
+  // === Upload (stage only, no indexing) ===
   const handleUpload = async (e: React.FormEvent) => {
     e.preventDefault();
     if (!file) {
-      alert("Please select a file first.");
+      setError("Please select a PDF first.");
       return;
     }
-    setUploadStatus("Uploading...");
-    setTrainStatus(""); // Reset training status on new upload
+    setError("");
+    setBanner("");
+    setIsUploading(true);
+    setUploadStatus("Uploading…");
+
     const formData = new FormData();
     formData.append("file", file);
-    formData.append("base_model", "microsoft/phi-2");
-    formData.append("task_type", "causal-lm");
 
     try {
       const res = await fetch(`${backendUrl}/upload`, {
@@ -45,147 +117,399 @@ export default function Home() {
       });
       const data = await res.json();
       if (res.ok) {
-        setUploadedFilename(data.filename);
-        setUploadStatus(`✅ Upload successful! Ready to train with ${data.filename}.`);
+        console.log("UPLOAD OK:", data); // should show { status: "staged"/"exists", doc_id, ... }
+        setUploadStatus(
+          data.status === "exists" ? `Already added: ${data.filename}` : `Added: ${data.filename}`
+        );
+        await fetchDocs();  // should now repopulate Library
       } else {
-        setUploadStatus(`Upload failed: ${data.detail || "Unknown error"}`);
+        setUploadStatus("");
+        setError(data?.detail || "Upload failed");
       }
     } catch (err) {
-      setUploadStatus("❌ Upload failed. Is the backend server running?");
+      setUploadStatus("");
+      setError("Upload failed. Is the backend running on :8000?");
       console.error(err);
+    } finally {
+      setIsUploading(false);
     }
   };
 
-  const handleTrain = async () => {
-    if (!uploadedFilename) {
-      alert("Please upload a dataset first.");
-      return;
-    }
-    // This message is updated by the backend immediately, but we'll set a local one too
-    setTrainStatus("🚀 Training started... Monitor the backend console for progress.");
-    
-    // The actual training runs in the background on the server
+  // === Delete a doc from library ===
+  const deleteDoc = async (doc_id: string) => {
     try {
-      await fetch(`${backendUrl}/train`, {
+      const res = await fetch(`${backendUrl}/docs/${doc_id}`, { method: "DELETE" });
+      const data = await res.json();
+      if (res.ok) {
+        setToast(`Removed ${data.removed} file(s). Click “Build Index” to apply.`);
+        if (selectedDocIds.includes(doc_id)) {
+          setSelectedDocIds((prev) => prev.filter((d) => d !== doc_id));
+        }
+        await fetchDocs();
+      } else {
+        setError(data?.detail || "Delete failed");
+      }
+    } catch (e) {
+      setError("Delete failed.");
+    }
+  };
+
+  // === Build / Rebuild the index ===
+  const buildIndex = async () => {
+    setIsIndexing(true);
+    setToast("");
+    setError("");
+    try {
+      const body =
+        selectedDocIds.length > 0 ? { doc_ids: selectedDocIds } : { doc_ids: null };
+      const res = await fetch(`${backendUrl}/index`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ filename: uploadedFilename }),
+        body: JSON.stringify(body),
       });
-      // Note: We don't get a "finished" message here because it's a background task.
-      // The user will know it's done by watching the backend console.
-      // For a real production app, you'd use WebSockets or polling to get the status.
+      const data = await res.json();
+      if (res.ok) {
+        setToast(
+          `Indexed ${data.docs_indexed} document(s) • ${data.total_chunks} chunks`
+        );
+      } else {
+        setError(data?.detail || "Indexing failed");
+      }
+    } catch (e) {
+      setError("Indexing failed.");
+    } finally {
+      setIsIndexing(false);
+    }
+  };
+
+  const toggleDoc = (id: string) => {
+    setSelectedDocIds((prev) =>
+      prev.includes(id) ? prev.filter((d) => d !== id) : [...prev, id]
+    );
+  };
+
+  const clearDocSelection = () => setSelectedDocIds([]);
+
+  // === Chat ===
+  const sendMessage = async (text: string) => {
+    setIsChatting(true);
+    setError("");
+    setBanner("");
+
+    const newHistory: ChatMessage[] = [...chatHistory, { role: "user", content: text }];
+    setChatHistory(newHistory);
+
+    try {
+      const body: any = { message: text };
+      if (selectedDocIds.length > 0) body.doc_ids = selectedDocIds;
+
+      const res = await fetch(`${backendUrl}/chat`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(body),
+      });
+
+      const data = await res.json().catch(() => ({} as any));
+
+      if (res.ok) {
+        const sources = (data as any)?.sources as ChatMessage extends {
+          role: "model";
+          sources: infer S;
+        }
+          ? S
+          : any;
+        setChatHistory([...newHistory, { role: "model", content: data.response, sources }]);
+      } else {
+        const detail = (data as any)?.detail || `HTTP ${res.status}`;
+        if (res.status === 503) {
+          setBanner(
+            "Index not ready. Add files and click “Build Index” first."
+          );
+        }
+        setChatHistory([...newHistory, { role: "model", content: `Error: ${detail}` }]);
+        setError(detail);
+      }
     } catch (err) {
-      setTrainStatus("❌ Failed to start training request.");
+      const msg = "Failed to reach server.";
+      setChatHistory([...newHistory, { role: "model", content: `Error: ${msg}` }]);
+      setError(msg);
       console.error(err);
+    } finally {
+      setIsChatting(false);
     }
   };
 
   const handleChatSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
-    if (!message || isChatting) return;
+    const trimmed = message.trim();
+    if (!trimmed || isChatting) return;
+    await sendMessage(trimmed);
+    setMessage("");
+  };
 
-    setIsChatting(true);
-    const newHistory: ChatMessage[] = [...chatHistory, { role: "user", content: message }];
-    setChatHistory(newHistory);
-    const userMessage = message;
-    setMessage(""); // Clear the input box immediately
-
-    try {
-      const res = await fetch(`${backendUrl}/chat`, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ message: userMessage }),
-      });
-      const data = await res.json();
-      if (res.ok) {
-        setChatHistory([...newHistory, { role: "model", content: data.response }]);
-      } else {
-        setChatHistory([...newHistory, { role: "model", content: "Error: Could not get a response." }]);
+  const handleKeyDown = (e: React.KeyboardEvent<HTMLTextAreaElement>) => {
+    if (e.key === "Enter" && !e.shiftKey) {
+      e.preventDefault();
+      const trimmed = message.trim();
+      if (trimmed && !isChatting) {
+        void sendMessage(trimmed);
+        setMessage("");
       }
-    } catch (err) {
-      setChatHistory([...newHistory, { role: "model", content: "Error: Failed to connect to the server." }]);
-      console.error(err);
-    } finally {
-      setIsChatting(false); // Re-enable the send button
     }
   };
 
-  return (
-    <main
-      className="min-h-screen p-4 md:p-10 flex flex-col items-center justify-start space-y-6"
-      style={{ backgroundColor: "var(--background)", color: "var(--foreground)" }}
-    >
-      <div className="w-full max-w-2xl">
-        <h1 className="text-4xl font-bold text-center mb-6">Fine-Tune & Chat</h1>
-        
-        {/* --- Upload and Train Section --- */}
-        <div className="space-y-4 w-full p-6 rounded-lg shadow-md mb-6" style={{ border: "1px solid var(--foreground)" }}>
-          <h2 className="text-2xl font-semibold">1. Upload & Train</h2>
-          <form onSubmit={handleUpload} className="space-y-3">
-            <input
-              type="file"
-              accept=".json"
-              onChange={(e) => setFile(e.target.files?.[0] || null)}
-              className="w-full p-2 border rounded" style={{ backgroundColor: "var(--background)", color: "var(--foreground)", borderColor: "var(--foreground)" }}
-            />
-            <button
-              type="submit"
-              className="w-full bg-blue-600 hover:bg-blue-700 p-2 rounded text-white font-semibold disabled:bg-gray-500"
-              disabled={!file || uploadStatus === "Uploading..."}
-            >
-              Upload Dataset
-            </button>
-          </form>
-          {uploadStatus && <p className="text-sm text-center font-semibold">{uploadStatus}</p>}
-          <button
-            onClick={handleTrain}
-            className="w-full bg-green-600 hover:bg-green-700 p-3 rounded text-white font-semibold disabled:bg-gray-500"
-            disabled={!uploadedFilename || trainStatus.startsWith("🚀")}
-          >
-            Start Training
-          </button>
-          {trainStatus && <p className="text-sm text-center font-semibold">{trainStatus}</p>}
-        </div>
+  const allDocsSelected = selectedDocIds.length === 0;
 
-        {/* --- Chat Section --- */}
-        {/* We'll show the chat box once a file is uploaded, so you can chat after training is done */}
-        {uploadedFilename && (
-          <div className="w-full p-6 rounded-lg shadow-md" style={{ border: "1px solid var(--foreground)" }}>
-            <h2 className="text-2xl font-semibold mb-4">2. Chat with your Model</h2>
-            <div className="h-80 overflow-y-auto p-4 mb-4 rounded space-y-4 bg-gray-800" style={{ border: "1px solid var(--foreground)" }}>
-              {chatHistory.map((msg, index) => (
-                <div key={index} className={`flex ${msg.role === 'user' ? 'justify-end' : 'justify-start'}`}>
-                  <div className={`p-3 rounded-lg max-w-xs md:max-w-md text-white ${msg.role === 'user' ? 'bg-blue-600' : 'bg-gray-600'}`}>
-                    {msg.content}
+  return (
+    <main className="min-h-screen w-full bg-gradient-to-b from-black via-zinc-950 to-black text-zinc-100">
+      {/* Header */}
+      <header className="sticky top-0 z-10 backdrop-blur supports-[backdrop-filter]:bg-black/40 bg-black/30 border-b border-white/10">
+        <div className="mx-auto max-w-6xl px-4 py-4 flex items-center justify-between">
+          <div className="text-xs text-zinc-500">Local • Private • Fast</div>
+          <div className="flex items-center gap-2">
+            {toast && (
+              <span className="text-[11px] rounded-md border border-emerald-400/30 bg-emerald-500/10 px-2 py-1 text-emerald-200">
+                {toast}
+              </span>
+            )}
+            {error && (
+              <span className="text-[11px] rounded-md border border-red-400/30 bg-red-500/10 px-2 py-1 text-red-200">
+                {error}
+              </span>
+            )}
+          </div>
+        </div>
+      </header>
+
+      <div className="mx-auto max-w-6xl px-4 py-6 grid grid-cols-1 lg:grid-cols-5 gap-6">
+        {/* Left: Library + Upload */}
+        <section className="lg:col-span-2 space-y-6">
+          {/* Library */}
+          <div className="rounded-2xl border border-white/10 bg-white/5 p-5 shadow-xl shadow-black/30">
+            <div className="flex items-center justify-between mb-3">
+              <h2 className="text-base font-semibold">Library</h2>
+              <div className="flex items-center gap-2">
+                <button
+                  onClick={buildIndex}
+                  disabled={isIndexing || docs.length === 0}
+                  className="text-[11px] px-3 py-1.5 rounded-lg bg-emerald-600 hover:bg-emerald-500 text-white disabled:bg-zinc-700"
+                  title={
+                    selectedDocIds.length > 0
+                      ? "Build index for selected docs"
+                      : "Build index for all docs"
+                  }
+                >
+                  {isIndexing
+                    ? "Building…"
+                    : selectedDocIds.length > 0
+                    ? "Build Index (Selected)"
+                    : "Build Index (All)"}
+                </button>
+                {!allDocsSelected && (
+                  <button
+                    onClick={clearDocSelection}
+                    className="text-[11px] px-2 py-1 rounded-lg border border-white/10 bg-white/5 hover:bg-white/10"
+                  >
+                    Clear
+                  </button>
+                )}
+                <span className="text-[11px] text-zinc-400">
+                  {docs.length} file{docs.length !== 1 ? "s" : ""}
+                </span>
+              </div>
+            </div>
+
+            {/* Doc chips */}
+            <div className="flex flex-col gap-2">
+              {docs.length === 0 && (
+                <div className="text-[12px] text-zinc-400">No files yet. Upload below.</div>
+              )}
+
+              {docs.map((d) => {
+                const active = selectedDocIds.includes(d.doc_id);
+                return (
+                  <div
+                    key={d.doc_id}
+                    className={`flex items-center justify-between rounded-xl px-3 py-2 ring-1 ${
+                      active
+                        ? "bg-indigo-500/15 ring-indigo-400/30"
+                        : "bg-black/30 ring-white/10"
+                    }`}
+                  >
+                    <button
+                      onClick={() => toggleDoc(d.doc_id)}
+                      className="flex-1 text-left truncate"
+                      title={d.filename}
+                    >
+                      <div className="text-xs font-medium text-zinc-100 truncate">
+                        {d.filename}
+                      </div>
+                      <div className="text-[11px] text-zinc-400">
+                        {d.pages}p • {d.chunk_count}c
+                      </div>
+                    </button>
+                    <button
+                      onClick={() => deleteDoc(d.doc_id)}
+                      className="ml-2 shrink-0 text-[11px] rounded-md border border-white/10 px-2 py-1 hover:bg-white/10"
+                      title="Remove from library"
+                    >
+                      Delete
+                    </button>
+                  </div>
+                );
+              })}
+            </div>
+          </div>
+
+          {/* Upload */}
+          <div className="rounded-2xl border border-white/10 bg-white/5 p-5 shadow-xl shadow-black/30">
+            <h2 className="text-base font-semibold mb-3">Upload</h2>
+
+            <label htmlFor="pdf" className="block">
+              <div className="group cursor-pointer rounded-xl border border-dashed border-white/15 bg-black/30 hover:bg-black/40 transition p-5 text-center">
+                <input
+                  id="pdf"
+                  type="file"
+                  accept=".pdf"
+                  className="hidden"
+                  onChange={(e) => handleFileInput(e.target.files?.[0] || null)}
+                />
+                <div className="text-sm text-zinc-300">
+                  {file ? (
+                    <>
+                      <div className="truncate font-medium text-zinc-100">
+                        {file.name}
+                      </div>
+                      <div className="text-xs text-zinc-400">Click to replace</div>
+                    </>
+                  ) : (
+                    <>
+                      <div className="font-medium">Click to select a PDF</div>
+                      <div className="text-xs text-zinc-400">Only .pdf is accepted</div>
+                    </>
+                  )}
+                </div>
+              </div>
+            </label>
+
+            <button
+              onClick={handleUpload}
+              disabled={!file || isUploading}
+              className="mt-4 inline-flex w-full items-center justify-center rounded-xl bg-gradient-to-br from-indigo-600 to-violet-600 px-4 py-2.5 text-sm font-semibold text-white shadow-lg shadow-indigo-900/30 disabled:from-zinc-700 disabled:to-zinc-700 disabled:shadow-none"
+            >
+              {isUploading ? "Adding…" : "Add to Library"}
+            </button>
+
+            {uploadStatus && (
+              <p className="mt-3 text-xs text-emerald-300/90">{uploadStatus}</p>
+            )}
+            {banner && (
+              <p className="mt-3 text-xs text-amber-300/90">{banner}</p>
+            )}
+            {error && <p className="mt-3 text-xs text-red-300/90">{error}</p>}
+
+            <p className="mt-3 text-[11px] text-zinc-400">
+              After adding files, click <span className="text-zinc-300">Build Index</span> to
+              refresh search.
+            </p>
+          </div>
+        </section>
+
+        {/* Right: Chat */}
+        <section className="lg:col-span-3">
+          <div className="rounded-2xl border border-white/10 bg-white/5 p-5 shadow-xl shadow-black/30 flex flex-col h-[70vh]">
+            <div className="flex items-center justify-between mb-3">
+              <h2 className="text-base font-semibold">Chat</h2>
+              {selectedDocIds.length > 0 ? (
+                <span className="text-[11px] text-zinc-400">
+                  Filtering {selectedDocIds.length} doc{selectedDocIds.length !== 1 ? "s" : ""}
+                </span>
+              ) : (
+                <span className="text-[11px] text-zinc-400">All documents</span>
+              )}
+            </div>
+
+            {/* Inline banner for backend issues */}
+            {banner && (
+              <div className="mb-3 rounded-lg border border-amber-400/40 bg-amber-50/10 px-3 py-2 text-xs text-amber-200">
+                {banner}
+              </div>
+            )}
+
+            <div className="flex-1 overflow-y-auto rounded-xl bg-black/30 border border-white/10 p-4 space-y-3">
+              {chatHistory.length === 0 && (
+                <div className="text-center text-sm text-zinc-400 py-10">
+                  Add files, build the index, then ask a question.
+                </div>
+              )}
+
+              {chatHistory.map((msg, i) => (
+                <div
+                  key={i}
+                  className={`flex ${msg.role === "user" ? "justify-end" : "justify-start"}`}
+                >
+                  <div
+                    className={`max-w-[80%] rounded-2xl px-4 py-3 text-sm leading-relaxed shadow ${
+                      msg.role === "user"
+                        ? "bg-gradient-to-br from-indigo-600 to-violet-600 text-white"
+                        : "bg-white/10 text-zinc-100"
+                    }`}
+                  >
+                    <div>{msg.content}</div>
+
+                    {/* Grouped Sources */}
+                    {msg.role === "model" && (msg as any).sources?.length > 0 && (
+                      <div className="mt-3 border-t border-white/10 pt-2">
+                        <div className="text-[11px] text-zinc-400 mb-1">Sources</div>
+                        <div className="flex flex-col gap-1.5">
+                          {groupSources((msg as any).sources).map((g, idx) => (
+                            <div key={idx} className="text-[12px] text-zinc-300">
+                              <span className="font-medium">{g.file}</span>
+                              <span className="text-zinc-500"> — p.</span>
+                              <span>{g.pages.join(", ")}</span>
+                            </div>
+                          ))}
+                        </div>
+                      </div>
+                    )}
                   </div>
                 </div>
               ))}
-               {isChatting && (
+
+              {isChatting && (
                 <div className="flex justify-start">
-                  <div className="p-3 rounded-lg max-w-xs md:max-w-md text-white bg-gray-600">
-                    <span className="animate-pulse">...</span>
+                  <div className="max-w-[80%] rounded-2xl px-4 py-3 text-sm bg-white/10 text-zinc-100 shadow">
+                    <span className="inline-flex animate-pulse">Thinking…</span>
                   </div>
                 </div>
               )}
+              <div ref={chatBottomRef} />
             </div>
-            <form onSubmit={handleChatSubmit} className="flex space-x-2">
-              <input
-                type="text"
-                value={message}
-                onChange={(e) => setMessage(e.target.value)}
-                placeholder="Ask your model a question..."
-                className="w-full p-2 border rounded" style={{ backgroundColor: "var(--background)", color: "var(--foreground)", borderColor: "var(--foreground)" }}
-              />
-              <button
-                type="submit"
-                className="bg-purple-600 hover:bg-purple-700 p-2 rounded text-white font-semibold disabled:bg-gray-500"
-                disabled={isChatting}
-              >
-                Send
-              </button>
+
+            <form onSubmit={handleChatSubmit} className="mt-4">
+              <div className="flex items-end gap-2">
+                <textarea
+                  value={message}
+                  onChange={(e) => setMessage(e.target.value)}
+                  onKeyDown={handleKeyDown}
+                  placeholder="Ask a question… (Shift+Enter for newline)"
+                  rows={2}
+                  className="flex-1 resize-none rounded-xl border border-white/10 bg-black/40 px-3 py-2 text-sm outline-none ring-0 placeholder:text-zinc-500"
+                />
+                <button
+                  type="submit"
+                  disabled={isChatting || message.trim().length === 0}
+                  className="h-10 shrink-0 rounded-xl bg-gradient-to-br from-emerald-600 to-green-600 px-4 text-sm font-semibold text-white shadow-lg shadow-emerald-900/30 disabled:from-zinc-700 disabled:to-zinc-700 disabled:shadow-none"
+                >
+                  {isChatting ? "Sending…" : "Send"}
+                </button>
+              </div>
+              <div className="mt-2 flex items-center justify-between text-[11px] text-zinc-500">
+                <span>Enter to send • Shift+Enter for newline</span>
+              </div>
             </form>
           </div>
-        )}
+        </section>
       </div>
     </main>
   );
