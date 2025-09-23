@@ -4,19 +4,60 @@ import json
 import pickle
 import uuid
 import hashlib
+import logging
+import shutil
+import time
 import urllib.request
 import urllib.error
+from contextlib import asynccontextmanager
+from dataclasses import dataclass
+from datetime import datetime
+import sys
 from pathlib import Path
-from typing import List, Tuple
+from threading import Lock
+from typing import Dict, List, Optional, Tuple
 
 import numpy as np
 import faiss
-from fastapi import FastAPI, UploadFile, HTTPException
+from fastapi import Depends, FastAPI, UploadFile, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from sentence_transformers import SentenceTransformer
 from PyPDF2 import PdfReader
+from sqlalchemy import delete, func, or_, select
+from sqlalchemy.orm import Session
 
+if __package__:
+    try:
+        from .auth import (
+            create_access_token,
+            get_current_user,
+            hash_password,
+            verify_password,
+        )
+        from .db import SessionLocal, get_db, init_db
+        from .models import ChatMessage, ChatSession, Chunk, Document, Section, User
+    except ModuleNotFoundError as exc:
+        if exc.name == "jwt":
+            raise ModuleNotFoundError("Missing dependency \"PyJWT\". Run `pip install -r requirements.txt` in the backend virtualenv.") from exc
+        raise
+else:
+    CURRENT_DIR = Path(__file__).resolve().parent
+    if str(CURRENT_DIR) not in sys.path:
+        sys.path.append(str(CURRENT_DIR))
+    try:
+        from auth import (
+            create_access_token,
+            get_current_user,
+            hash_password,
+            verify_password,
+        )
+        from db import SessionLocal, get_db, init_db
+        from models import ChatMessage, ChatSession, Chunk, Document, Section, User
+    except ModuleNotFoundError as exc:
+        if exc.name == "jwt":
+            raise ModuleNotFoundError("Missing dependency \"PyJWT\". Run `pip install -r requirements.txt` in the backend virtualenv.") from exc
+        raise
 # =========================
 # Config (env-tunable)
 # =========================
@@ -27,16 +68,20 @@ TOP_K = int(os.getenv("TOP_K", "4"))                      # retrieval depth
 CONTEXT_CHAR_LIMIT = int(os.getenv("CONTEXT_CHAR_LIMIT", "2500"))
 MAX_NEW_TOKENS = int(os.getenv("MAX_NEW_TOKENS", "150"))  # default answer length
 TEMPERATURE = float(os.getenv("TEMPERATURE", "0.0"))
+LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
+
+OLLAMA_TIMEOUT = float(os.getenv("OLLAMA_TIMEOUT", "30"))
+OLLAMA_RETRIES = int(os.getenv("OLLAMA_RETRIES", "2"))
 
 BASE_DIR = Path(__file__).parent.resolve()
 UPLOAD_DIR = os.getenv("UPLOAD_DIR", str(BASE_DIR / "uploaded_docs"))
 STORE_DIR  = os.getenv("STORE_DIR",  str(BASE_DIR / "store"))
-INDEX_PATH = str(Path(STORE_DIR) / "index.faiss")
+LEGACY_INDEX_PATH = Path(STORE_DIR) / "index.faiss"
 # --- NEW: dual-index paths for section-aware retrieval ---
-SECT_INDEX_PATH = str(Path(STORE_DIR) / "sections.index.faiss")
-SECT_META_PATH  = str(Path(STORE_DIR) / "sections.meta.pkl")
-CHUNK_INDEX_PATH = str(Path(STORE_DIR) / "chunks.index.faiss")
-CHUNK_META_PATH  = str(Path(STORE_DIR) / "chunks.meta.pkl")
+LEGACY_SECT_INDEX_PATH = Path(STORE_DIR) / "sections.index.faiss"
+LEGACY_SECT_META_PATH = Path(STORE_DIR) / "sections.meta.pkl"
+LEGACY_CHUNK_INDEX_PATH = Path(STORE_DIR) / "chunks.index.faiss"
+LEGACY_CHUNK_META_PATH = Path(STORE_DIR) / "chunks.meta.pkl"
 
 # Section-aware retrieval knobs
 SECTION_OVERFETCH = int(os.getenv("SECTION_OVERFETCH", "12"))
@@ -44,8 +89,8 @@ SECTIONS_FINAL = int(os.getenv("SECTIONS_FINAL", "6"))        # keep this many s
 CHUNKS_PER_SECTION = int(os.getenv("CHUNKS_PER_SECTION", "2")) # zoom-in per section
 GLOBAL_TOP_K = int(os.getenv("GLOBAL_TOP_K", "6"))             # final chunk count (can be >= TOP_K)
 
-META_PATH  = str(Path(STORE_DIR) / "meta.pkl")
-DOCS_PATH  = str(Path(STORE_DIR) / "docs.json")
+LEGACY_META_PATH = Path(STORE_DIR) / "meta.pkl"
+LEGACY_DOCS_PATH = Path(STORE_DIR) / "docs.json"
 
 EMBED_MODEL_NAME = os.getenv("EMBED_MODEL", "sentence-transformers/all-MiniLM-L6-v2")
 DIVERSITY_SIM_THRESHOLD = float(os.getenv("DIVERSITY_SIM_THRESHOLD", "0.95"))
@@ -55,18 +100,51 @@ OVERFETCH_MULT = int(os.getenv("OVERFETCH_MULT", "5"))
 OVERVIEW_TRIGGERS = tuple(
     s.strip() for s in os.getenv(
         "OVERVIEW_TRIGGERS",
-        "what is;what’s;whats;overview;summary;high level;broadly;explain the paper;describe the paper"
+        "what is;whatâ€™s;whats;overview;summary;high level;broadly;explain the paper;describe the paper"
     ).split(";")
     if s.strip()
 )
 
+_NUMERIC_LOG_LEVEL = getattr(logging, LOG_LEVEL, logging.INFO)
+logging.basicConfig(
+    level=_NUMERIC_LOG_LEVEL,
+    format="%(asctime)s %(levelname)s [%(name)s] %(message)s"
+)
+logger = logging.getLogger("rag_backend")
+logger.setLevel(_NUMERIC_LOG_LEVEL)
+
 os.makedirs(UPLOAD_DIR, exist_ok=True)
 os.makedirs(STORE_DIR, exist_ok=True)
+
+
+@asynccontextmanager
+async def app_lifespan(app: FastAPI):
+    logger.info(
+        "Starting FastAPI application",
+    )
+    logger.info(
+        "Config: model=%s embed_model=%s top_k=%s global_top_k=%s",
+        MODEL_NAME,
+        EMBED_MODEL_NAME,
+        TOP_K,
+        GLOBAL_TOP_K,
+    )
+    try:
+        init_db()
+        with SessionLocal() as db:
+            migrate_legacy_docs(db)
+            doc_total = db.scalar(select(func.count()).select_from(Document)) or 0
+            user_total = db.scalar(select(func.count()).select_from(User)) or 0
+            logger.info("Database ready (users=%d docs=%d)", user_total, doc_total)
+    except Exception:
+        logger.exception("Failed to initialise database")
+    yield
+    logger.info("FastAPI application shutdown complete")
 
 # =========================
 # FastAPI app
 # =========================
-app = FastAPI(docs_url="/api", redoc_url=None, openapi_url="/openapi.json")
+app = FastAPI(docs_url="/api", redoc_url=None, openapi_url="/openapi.json", lifespan=app_lifespan)
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],   # tighten in prod
@@ -79,17 +157,20 @@ app.add_middleware(
 # Globals (in-memory)
 # =========================
 emb_model: SentenceTransformer | None = None
-faiss_index: faiss.IndexFlatIP | None = None
-# metadata: list of dicts with {"text": str, "page": int, "doc_id": str, "source": str, "kind": "profile"|"chunk"}
-metadata: List[dict] = []
-# --- NEW: dual indexes for section-aware retrieval ---
-sections_index: faiss.IndexFlatIP | None = None
-sections_meta: List[dict] = []  # [{"text","doc_id","section_id","section_title","page","kind":"section"}]
 
-chunks_index: faiss.IndexFlatIP | None = None
-chunks_meta: List[dict] = []
-# docs_registry entries now include optional "profile"
-docs_registry: List[dict] = []  # [{doc_id, filename, path, sha256, pages, chunk_count, uploaded_at, profile?}]
+
+@dataclass
+class StoreState:
+    faiss_index: Optional[faiss.IndexFlatIP] = None
+    metadata: Optional[List[dict]] = None
+    sections_index: Optional[faiss.IndexFlatIP] = None
+    sections_meta: Optional[List[dict]] = None
+    chunks_index: Optional[faiss.IndexFlatIP] = None
+    chunks_meta: Optional[List[dict]] = None
+
+
+store_cache: Dict[int, StoreState] = {}
+store_cache_lock = Lock()
 
 # =========================
 # Utilities
@@ -97,6 +178,7 @@ docs_registry: List[dict] = []  # [{doc_id, filename, path, sha256, pages, chunk
 def load_embedder() -> SentenceTransformer:
     global emb_model
     if emb_model is None:
+        logger.info("Loading embedding model %s", EMBED_MODEL_NAME)
         emb_model = SentenceTransformer(EMBED_MODEL_NAME)
     return emb_model
 
@@ -279,72 +361,184 @@ def make_doc_profile(pairs: List[Tuple[str, int]], filename: str) -> str:
     profile = f"TITLE: {title}\nSUMMARY: {abstract.strip()}"
     return profile
 
-def save_store(index: faiss.IndexFlatIP, meta: List[dict]) -> None:
-    faiss.write_index(index, INDEX_PATH)
-    with open(META_PATH, "wb") as f:
-        pickle.dump(meta, f)
+def _parse_uploaded_at(value: str | None) -> datetime:
+    if not value:
+        return datetime.utcnow()
+    try:
+        return datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except Exception:
+        return datetime.utcnow()
 
-def save_dual_stores(sec_index, sec_meta, ch_index, ch_meta) -> None:
-    faiss.write_index(sec_index, SECT_INDEX_PATH)
-    with open(SECT_META_PATH, "wb") as f: pickle.dump(sec_meta, f)
-    faiss.write_index(ch_index, CHUNK_INDEX_PATH)
-    with open(CHUNK_META_PATH, "wb") as f: pickle.dump(ch_meta, f)
 
-def load_store():
-    if not (os.path.exists(INDEX_PATH) and os.path.exists(META_PATH)):
-        return None, None
-    index = faiss.read_index(INDEX_PATH)
-    with open(META_PATH, "rb") as f:
-        meta = pickle.load(f)
-    return index, meta
+def migrate_legacy_docs(db: Session) -> None:
+    if not LEGACY_DOCS_PATH.exists():
+        return
+    existing_docs = db.scalar(select(func.count()).select_from(Document)) or 0
+    if existing_docs:
+        return
+    try:
+        with LEGACY_DOCS_PATH.open("r", encoding="utf-8") as f:
+            legacy_docs = json.load(f)
+    except Exception as exc:  # pragma: no cover - legacy path only
+        logger.warning("Failed to read legacy docs.json: %s", exc)
+        return
 
-def load_dual_stores():
-    if not (os.path.exists(SECT_INDEX_PATH) and os.path.exists(SECT_META_PATH)
-            and os.path.exists(CHUNK_INDEX_PATH) and os.path.exists(CHUNK_META_PATH)):
+    imported = 0
+    for entry in legacy_docs:
+        doc_id = entry.get("doc_id") or uuid.uuid4().hex[:8]
+        if db.execute(select(Document).where(Document.doc_id == doc_id)).scalar_one_or_none():
+            continue
+        document = Document(
+            doc_id=doc_id,
+            owner_id=None,
+            filename=entry.get("filename", ""),
+            path=entry.get("path", ""),
+            sha256=entry.get("sha256", ""),
+            pages=entry.get("pages", 0) or 0,
+            section_count=entry.get("section_count", 0) or entry.get("sections", 0) or 0,
+            chunk_count=entry.get("chunk_count", 0) or 0,
+            uploaded_at=_parse_uploaded_at(entry.get("uploaded_at")),
+            profile=entry.get("profile"),
+            shared=True,
+        )
+        db.add(document)
+        imported += 1
+    if imported:
+        db.commit()
+        backup_path = LEGACY_DOCS_PATH.with_suffix(".migrated.json")
+        try:
+            LEGACY_DOCS_PATH.rename(backup_path)
+        except OSError:
+            logger.warning("Could not rename legacy docs file after migration")
+        logger.info("Migrated %d legacy documents into database", imported)
+
+
+def user_store_dir(user_id: int) -> Path:
+    base = Path(STORE_DIR) / f"user_{user_id}"
+    base.mkdir(parents=True, exist_ok=True)
+    return base
+
+
+def store_paths(user_id: int) -> dict[str, Path]:
+    base = user_store_dir(user_id)
+    return {
+        "index": base / "index.faiss",
+        "meta": base / "meta.pkl",
+        "sections_index": base / "sections.index.faiss",
+        "sections_meta": base / "sections.meta.pkl",
+        "chunks_index": base / "chunks.index.faiss",
+        "chunks_meta": base / "chunks.meta.pkl",
+    }
+
+
+def clear_user_store(user_id: int) -> None:
+    with store_cache_lock:
+        store_cache.pop(user_id, None)
+    for path in store_paths(user_id).values():
+        try:
+            if path.exists():
+                path.unlink()
+        except OSError:
+            logger.warning("Failed to remove store file %s", path)
+
+
+def load_user_store_from_disk(user_id: int) -> StoreState | None:
+    paths = store_paths(user_id)
+    try:
+        if not (paths["index"].exists() and paths["meta"].exists()):
+            return None
+        idx = faiss.read_index(str(paths["index"]))
+        with paths["meta"].open("rb") as f:
+            meta = pickle.load(f)
+
+        sec_idx = None
+        sec_meta = None
+        ch_idx = None
+        ch_meta = None
+        if (
+            paths["sections_index"].exists()
+            and paths["sections_meta"].exists()
+            and paths["chunks_index"].exists()
+            and paths["chunks_meta"].exists()
+        ):
+            sec_idx = faiss.read_index(str(paths["sections_index"]))
+            with paths["sections_meta"].open("rb") as f:
+                sec_meta = pickle.load(f)
+            ch_idx = faiss.read_index(str(paths["chunks_index"]))
+            with paths["chunks_meta"].open("rb") as f:
+                ch_meta = pickle.load(f)
+        return StoreState(
+            faiss_index=idx,
+            metadata=meta,
+            sections_index=sec_idx,
+            sections_meta=sec_meta,
+            chunks_index=ch_idx,
+            chunks_meta=ch_meta,
+        )
+    except Exception:
+        logger.exception("Failed to load user %s store from disk", user_id)
         return None
-    sidx = faiss.read_index(SECT_INDEX_PATH)
-    with open(SECT_META_PATH, "rb") as f: smeta = pickle.load(f)
-    cidx = faiss.read_index(CHUNK_INDEX_PATH)
-    with open(CHUNK_META_PATH, "rb") as f: cmeta = pickle.load(f)
-    return sidx, smeta, cidx, cmeta
 
-def load_docs() -> list[dict]:
-    if not os.path.exists(DOCS_PATH):
-        return []
-    with open(DOCS_PATH, "r", encoding="utf-8") as f:
-        return json.load(f)
 
-def save_docs(docs: list[dict]) -> None:
-    with open(DOCS_PATH, "w", encoding="utf-8") as f:
-        json.dump(docs, f, ensure_ascii=False, indent=2)
+def persist_user_store(user_id: int, state: StoreState) -> None:
+    paths = store_paths(user_id)
+    if state.faiss_index is not None and state.metadata is not None:
+        faiss.write_index(state.faiss_index, str(paths["index"]))
+        with paths["meta"].open("wb") as f:
+            pickle.dump(state.metadata, f)
+    if (
+        state.sections_index is not None
+        and state.sections_meta is not None
+        and state.chunks_index is not None
+        and state.chunks_meta is not None
+    ):
+        faiss.write_index(state.sections_index, str(paths["sections_index"]))
+        with paths["sections_meta"].open("wb") as f:
+            pickle.dump(state.sections_meta, f)
+        faiss.write_index(state.chunks_index, str(paths["chunks_index"]))
+        with paths["chunks_meta"].open("wb") as f:
+            pickle.dump(state.chunks_meta, f)
+
+
+def get_store_state(user_id: int) -> StoreState | None:
+    with store_cache_lock:
+        cached = store_cache.get(user_id)
+    if cached and cached.faiss_index is not None and cached.metadata:
+        return cached
+    loaded = load_user_store_from_disk(user_id)
+    if loaded:
+        with store_cache_lock:
+            store_cache[user_id] = loaded
+    return loaded
 
 # =========================
 # Retrieval with diversity
 # =========================
-def retrieve(query: str, k: int = TOP_K, allowed_doc_ids: List[str] | None = None) -> List[dict]:
+def retrieve(store: StoreState, query: str, k: int = TOP_K, allowed_doc_ids: List[str] | None = None) -> List[dict]:
     """
     Greedy selection with:
       - doc_id+page de-dupe (avoid N chunks from the same page)
       - similarity de-dupe (avoid near-identical chunks across pages/docs)
     """
-    assert faiss_index is not None and metadata, "Index not ready."
+    if store.faiss_index is None or not store.metadata:
+        raise HTTPException(status_code=503, detail="Index not ready. Build the index first.")
     model = load_embedder()
 
     q = model.encode([query], convert_to_numpy=True)
     q = normalize(q.astype(np.float32))
 
     over_k = max(k * OVERFETCH_MULT, k + 10)
-    D, I = faiss_index.search(q, over_k)
+    D, I = store.faiss_index.search(q, over_k)
 
     allowed_set = set(allowed_doc_ids) if allowed_doc_ids else None
     cand_meta, cand_texts = [], []
     for idx in I[0]:
-        if 0 <= idx < len(metadata):
-            m = metadata[idx]
-            if allowed_set and m.get("doc_id") not in allowed_set:
+        if 0 <= idx < len(store.metadata):
+            meta_entry = store.metadata[idx]
+            if allowed_set and meta_entry.get("doc_id") not in allowed_set:
                 continue
-            cand_meta.append(m)
-            cand_texts.append(m["text"])
+            cand_meta.append(meta_entry)
+            cand_texts.append(meta_entry["text"])
 
     if not cand_meta:
         return []
@@ -356,120 +550,147 @@ def retrieve(query: str, k: int = TOP_K, allowed_doc_ids: List[str] | None = Non
     kept_embs: List[np.ndarray] = []
     seen_pages = set()  # (doc_id, page)
 
-    for j, m in enumerate(cand_meta):
-        key = (m.get("doc_id"), m.get("page"))
+    for j, meta_entry in enumerate(cand_meta):
+        key = (meta_entry.get("doc_id"), meta_entry.get("page"))
         if key in seen_pages:
             continue
-        e = cand_embs[j]
-        if any(float(np.dot(e, ke)) >= DIVERSITY_SIM_THRESHOLD for ke in kept_embs):
+        embedding = cand_embs[j]
+        if any(float(np.dot(embedding, kept)) >= DIVERSITY_SIM_THRESHOLD for kept in kept_embs):
             continue
-        results.append(m)
-        kept_embs.append(e)
+        results.append(meta_entry)
+        kept_embs.append(embedding)
         seen_pages.add(key)
         if len(results) >= k:
             break
 
     if len(results) < k:
-        for m in cand_meta:
-            key = (m.get("doc_id"), m.get("page"))
+        for meta_entry in cand_meta:
+            key = (meta_entry.get("doc_id"), meta_entry.get("page"))
             if key in seen_pages:
                 continue
-            results.append(m)
+            results.append(meta_entry)
             seen_pages.add(key)
             if len(results) >= k:
                 break
     return results
 
-def retrieve_hierarchical(query: str, allowed_doc_ids: List[str] | None = None) -> List[dict]:
+
+def retrieve_hierarchical(store: StoreState, query: str, allowed_doc_ids: List[str] | None = None) -> List[dict]:
     """
-    Stage A: retrieve sections → diversity → select
-    Stage B: retrieve chunks globally, then filter to chosen sections → diversity/page de-dupe → final TOP-K
+    Stage A: retrieve sections + diversity + select
+    Stage B: retrieve chunks globally, then filter to chosen sections + diversity/page de-dupe + final TOP-K
     """
-    if sections_index is None or chunks_index is None:
-        return []  # fall back to flat retrieve() upstream
+    if store.sections_index is None or store.chunks_index is None:
+        return []
 
     model = load_embedder()
     q = model.encode([query], convert_to_numpy=True)
     q = normalize(q.astype(np.float32))
 
-    # --- Stage A: sections ---
     over_k = max(SECTION_OVERFETCH, SECTIONS_FINAL * OVERFETCH_MULT)
-    D_sec, I_sec = sections_index.search(q, over_k)
+    D_sec, I_sec = store.sections_index.search(q, over_k)
     cand_secs = []
     allowed = set(allowed_doc_ids) if allowed_doc_ids else None
+    sections_meta = store.sections_meta or []
     for idx in I_sec[0]:
         if 0 <= idx < len(sections_meta):
-            m = sections_meta[idx]
-            if allowed and m["doc_id"] not in allowed:
+            meta_entry = sections_meta[idx]
+            if allowed and meta_entry["doc_id"] not in allowed:
                 continue
-            cand_secs.append(m)
+            cand_secs.append(meta_entry)
     if not cand_secs:
         return []
 
-    # diversity on sections: avoid duplicate section titles/pages within same doc
     keep_secs, seen = [], set()
-    for m in cand_secs:
-        key = (m["doc_id"], m["section_title"])
-        if key in seen: 
+    for meta_entry in cand_secs:
+        key = (meta_entry["doc_id"], meta_entry.get("section_id"))
+        if key in seen:
             continue
-        keep_secs.append(m); seen.add(key)
+        keep_secs.append(meta_entry)
+        seen.add(key)
         if len(keep_secs) >= SECTIONS_FINAL:
             break
 
-    chosen_section_ids = {m["section_id"] for m in keep_secs}
+    chosen_section_ids = {meta_entry["section_id"] for meta_entry in keep_secs}
+    chosen_docs = {meta_entry["doc_id"] for meta_entry in keep_secs}
 
-    # --- Stage B: chunks ---
-    # Global overfetch, then filter to chosen sections
     over_chunks = max(GLOBAL_TOP_K * OVERFETCH_MULT, GLOBAL_TOP_K + 20)
-    D_ch, I_ch = chunks_index.search(q, over_chunks)
-
-    # gather candidate chunks from selected sections
-    cand = []
-    for idx in I_ch[0]:
+    D_chunks, I_chunks = store.chunks_index.search(q, over_chunks)
+    chunks_meta = store.chunks_meta or []
+    candidates = []
+    for idx in I_chunks[0]:
         if 0 <= idx < len(chunks_meta):
-            cm = chunks_meta[idx]
-            if allowed and cm["doc_id"] not in allowed:
+            chunk_entry = chunks_meta[idx]
+            if allowed and chunk_entry["doc_id"] not in allowed:
                 continue
-            if cm.get("section_id") in chosen_section_ids:
-                cand.append(cm)
+            if chunk_entry["doc_id"] not in chosen_docs:
+                continue
+            if chunk_entry.get("section_id") in chosen_section_ids:
+                candidates.append(chunk_entry)
 
-    if not cand:
-        # fallback: try flat global top-k filtered by allowed docs
-        return retrieve(query, k=GLOBAL_TOP_K, allowed_doc_ids=allowed_doc_ids)
+    if not candidates:
+        return retrieve(store, query, k=GLOBAL_TOP_K, allowed_doc_ids=allowed_doc_ids)
 
-    # diversity: avoid same (doc_id, page), avoid near-duplicate
-    results, kept_texts, seen_pages = [], [], set()
-    for m in cand:
-        key = (m["doc_id"], m.get("page", -1))
+    results: List[dict] = []
+    seen_pages = set()
+    seen_chunks: set[str] = set()
+    for entry in candidates:
+        key = (entry.get("doc_id"), entry.get("page"))
         if key in seen_pages:
             continue
-        # simple similarity de-dupe using text hashes (cheaper than re-embeddings)
-        txt_sig = hashlib.sha1(m["text"][:400].encode("utf-8")).hexdigest()[:12]
-        if txt_sig in kept_texts:
+        chunk_key = f"{entry.get('doc_id')}:{entry.get('section_id')}:{entry.get('page')}"
+        if chunk_key in seen_chunks:
             continue
-        results.append(m)
-        kept_texts.append(txt_sig)
+        results.append(entry)
         seen_pages.add(key)
+        seen_chunks.add(chunk_key)
         if len(results) >= GLOBAL_TOP_K:
             break
-
-    # If still thin, top up with remaining chunk hits (relaxed)
-    if len(results) < GLOBAL_TOP_K:
-        for m in cand:
-            key = (m["doc_id"], m.get("page", -1))
-            if key in seen_pages:
-                continue
-            results.append(m)
-            seen_pages.add(key)
-            if len(results) >= GLOBAL_TOP_K:
-                break
 
     return results
 
 
-# =========================
-# Prompt budgeting helpers
-# =========================
+def serialize_document(document: Document) -> dict:
+    return {
+        "doc_id": document.doc_id,
+        "filename": document.filename,
+        "pages": document.pages,
+        "section_count": document.section_count,
+        "chunk_count": document.chunk_count,
+        "uploaded_at": (document.uploaded_at or datetime.utcnow()).isoformat() + 'Z',
+        "profile": document.profile,
+        "shared": document.shared,
+    }
+
+
+def accessible_documents_query(user: User, include_shared: bool = True, doc_ids: Optional[List[str]] = None):
+    stmt = select(Document)
+    filters = []
+    if include_shared:
+        filters.append(Document.shared.is_(True))
+        filters.append(Document.owner_id.is_(None))
+    filters.append(Document.owner_id == user.id)
+    stmt = stmt.where(or_(*filters))
+    if doc_ids:
+        stmt = stmt.where(Document.doc_id.in_(doc_ids))
+    return stmt
+
+
+def get_accessible_documents(db: Session, user: User, doc_ids: Optional[List[str]] = None) -> List[Document]:
+    stmt = accessible_documents_query(user, doc_ids=doc_ids)
+    docs = db.execute(stmt).scalars().all()
+    if doc_ids and {d.doc_id for d in docs} != set(doc_ids):
+        raise HTTPException(status_code=403, detail="One or more documents are not accessible.")
+    return docs
+
+
+def ensure_store_for_user(user_id: int) -> StoreState:
+    store = get_store_state(user_id)
+    if store is None or store.faiss_index is None or not store.metadata:
+        raise HTTPException(status_code=503, detail="Index not ready. Build the index first.")
+    return store
+
+
 def _smart_cut(text: str, max_len: int) -> str:
     if len(text) <= max_len:
         return text
@@ -524,11 +745,50 @@ def ollama_generate(prompt: str, max_tokens: int = MAX_NEW_TOKENS, temperature: 
         },
     }
     data = json.dumps(payload).encode("utf-8")
-    req = urllib.request.Request(url, data=data, headers={"Content-Type": "application/json"})
-    with urllib.request.urlopen(req) as resp:
-        body = resp.read().decode("utf-8")
-        parsed = json.loads(body)
-    return parsed.get("response", "")
+    last_error: urllib.error.URLError | None = None
+    for attempt in range(OLLAMA_RETRIES + 1):
+        try:
+            req = urllib.request.Request(
+                url,
+                data=data,
+                headers={"Content-Type": "application/json"},
+            )
+            with urllib.request.urlopen(req, timeout=OLLAMA_TIMEOUT) as resp:
+                body = resp.read().decode("utf-8")
+            parsed = json.loads(body)
+            response = parsed.get("response", "")
+            logger.debug(
+                "Ollama generation succeeded (attempt %d, chars=%d)",
+                attempt + 1,
+                len(response),
+            )
+            return response
+        except urllib.error.HTTPError as http_err:
+            logger.error(
+                "Ollama HTTP error on attempt %d/%d: %s", 
+                attempt + 1,
+                OLLAMA_RETRIES + 1,
+                http_err,
+            )
+            raise
+        except urllib.error.URLError as url_err:
+            last_error = url_err
+            logger.warning(
+                "Ollama connection failed (attempt %d/%d): %s",
+                attempt + 1,
+                OLLAMA_RETRIES + 1,
+                url_err,
+            )
+            if attempt < OLLAMA_RETRIES:
+                sleep_for = min(2 ** attempt, 5.0)
+                time.sleep(sleep_for)
+        except json.JSONDecodeError as decode_err:
+            logger.error("Failed to decode Ollama response: %s", decode_err)
+            raise
+
+    if last_error is not None:
+        raise last_error
+    raise RuntimeError("Ollama did not return a response")
 
 def postprocess_answer(text: str) -> str:
     out = text or ""
@@ -549,266 +809,454 @@ def _file_sha256(b: bytes) -> str:
 class ChatRequest(BaseModel):
     message: str
     doc_ids: List[str] | None = None  # optional filter
+    session_id: Optional[str] = None
+
 
 class IndexRequest(BaseModel):
     doc_ids: List[str] | None = None  # if None, index all
 
+
+class SignupRequest(BaseModel):
+    email: str
+    password: str
+
+
+class LoginRequest(BaseModel):
+    email: str
+    password: str
+
+
+class TokenResponse(BaseModel):
+    access_token: str
+    token_type: str = "bearer"
+
+
 # =========================
 # Endpoints
 # =========================
+@app.post("/auth/signup", response_model=TokenResponse)
+def signup(payload: SignupRequest, db: Session = Depends(get_db)):
+    email = payload.email.strip().lower()
+    if not email:
+        raise HTTPException(status_code=400, detail="Email is required.")
+    existing = db.execute(select(User).where(User.email == email)).scalar_one_or_none()
+    if existing:
+        raise HTTPException(status_code=400, detail="Email is already registered.")
+    user_count = db.scalar(select(func.count()).select_from(User)) or 0
+    role = "admin" if user_count == 0 else "user"
+    user = User(email=email, password_hash=hash_password(payload.password), role=role)
+    db.add(user)
+    db.commit()
+    db.refresh(user)
+    if role == "admin":
+        orphan_docs = db.execute(select(Document).where(Document.owner_id.is_(None))).scalars().all()
+        changed = False
+        for doc in orphan_docs:
+            doc.owner_id = user.id
+            changed = True
+        if changed:
+            db.commit()
+    token = create_access_token(subject=user.id)
+    logger.info("User signed up: %s (role=%s)", email, role)
+    return TokenResponse(access_token=token)
+
+
+@app.post("/auth/login", response_model=TokenResponse)
+def login(payload: LoginRequest, db: Session = Depends(get_db)):
+    email = payload.email.strip().lower()
+    user = db.execute(select(User).where(User.email == email)).scalar_one_or_none()
+    if not user or not verify_password(payload.password, user.password_hash):
+        raise HTTPException(status_code=401, detail="Invalid email or password.")
+    token = create_access_token(subject=user.id)
+    logger.info("User logged in: %s", email)
+    return TokenResponse(access_token=token)
+
 @app.post("/upload")
-async def upload_pdf(file: UploadFile):
+async def upload_pdf(
+    file: UploadFile,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
     if file.content_type not in ("application/pdf", "application/octet-stream"):
         raise HTTPException(status_code=400, detail="Please upload a PDF.")
     raw = await file.read()
+    if not raw:
+        raise HTTPException(status_code=400, detail="Uploaded file is empty.")
     file_hash = _file_sha256(raw)
+    logger.info(
+        "Upload received: filename=%s size=%d bytes",
+        file.filename,
+        len(raw),
+    )
 
-    # dedupe on hash
-    existing = next((d for d in docs_registry if d.get("sha256") == file_hash), None)
+    existing = db.execute(
+        select(Document).where(Document.sha256 == file_hash, Document.owner_id == current_user.id)
+    ).scalar_one_or_none()
     if existing:
+        logger.info(
+            "Upload skipped (duplicate for user): filename=%s doc_id=%s",
+            file.filename,
+            existing.doc_id,
+        )
         return {
             "status": "exists",
-            "filename": existing["filename"],
-            "doc_id": existing["doc_id"],
-            "pages": existing.get("pages", 0),
-            "chunk_count": existing.get("chunk_count", 0),
+            "filename": existing.filename,
+            "doc_id": existing.doc_id,
+            "pages": existing.pages,
+            "chunk_count": existing.chunk_count,
         }
 
-    # persist file
     doc_id = uuid.uuid4().hex[:8]
     out_name = f"{doc_id}_{file.filename}"
     out_path = Path(UPLOAD_DIR) / out_name
-    with open(out_path, "wb") as f:
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    with out_path.open("wb") as f:
         f.write(raw)
 
-    record = {
-        "doc_id": doc_id,
-        "filename": file.filename,
-        "path": str(out_path),
-        "sha256": file_hash,
-        "pages": 0,
-        "chunk_count": 0,
-        "uploaded_at": __import__("datetime").datetime.utcnow().isoformat() + "Z",
-        # "profile": will be populated at index time
-    }
-    docs_registry.append(record)
-    save_docs(docs_registry)
-    return {"status": "staged", "filename": file.filename, "doc_id": doc_id}
+    document = Document(
+        doc_id=doc_id,
+        owner_id=current_user.id,
+        filename=file.filename,
+        path=str(out_path),
+        sha256=file_hash,
+        uploaded_at=datetime.utcnow(),
+    )
+    db.add(document)
+    db.commit()
+    db.refresh(document)
+
+    clear_user_store(current_user.id)
+
+    logger.info("File stored: filename=%s doc_id=%s user=%s", file.filename, doc_id, current_user.email)
+    return {"status": "staged", "filename": document.filename, "doc_id": document.doc_id}
 
 @app.post("/index")
-def build_index(req: IndexRequest):
-    global faiss_index, metadata, docs_registry
-    chosen = [d for d in docs_registry if (not req.doc_ids or d["doc_id"] in req.doc_ids)]
-    if not chosen:
+def build_index(
+    req: IndexRequest,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    doc_ids = req.doc_ids if req.doc_ids else None
+    documents = get_accessible_documents(db, current_user, doc_ids=doc_ids)
+    if not documents:
         raise HTTPException(status_code=400, detail="No documents selected to index.")
+
+    logger.info("Building vector indexes for %d document(s)", len(documents))
+    clear_user_store(current_user.id)
 
     model = load_embedder()
 
-    all_sec_texts, all_sec_meta = [], []
-    all_chunk_texts, all_chunk_meta = [], []
+    all_sec_texts: List[str] = []
+    all_sec_meta: List[dict] = []
+    all_chunk_texts: List[str] = []
+    all_chunk_meta: List[dict] = []
 
-    for d in chosen:
-        pages = extract_pages_text(d["path"])
-        secs = detect_sections_from_pages(pages, fallback_title_prefix=d["filename"])
+    for document in documents:
+        path = Path(document.path)
+        if not path.exists():
+            logger.warning("Document file missing on disk for doc_id=%s", document.doc_id)
+            continue
 
-        # per-doc stats
-        d["pages"] = sum(1 for p in pages if p)
-        d["section_count"] = len(secs)
-        d["chunk_count"] = 0  # will update below
+        pages = extract_pages_text(str(path))
+        sections = detect_sections_from_pages(pages, fallback_title_prefix=document.filename)
 
-        # profile (keep your existing behavior)
-        pairs_for_profile = []
-        # reuse your make_doc_profile(): build (text, page) pairs from first 2 pages
-        # We'll reconstruct minimal pairs to feed make_doc_profile()
-        for idx, txt in enumerate(pages[:2], start=1):
-            if txt:
-                for ch in chunk_text(txt):
-                    pairs_for_profile.append((ch, idx))
-        profile_text = make_doc_profile(pairs_for_profile, d["filename"])
-        d["profile"] = profile_text
-        # Option: store profile as a special "section" so it can be retrieved in Stage A
+        document.pages = sum(1 for p in pages if p)
+        document.section_count = len(sections)
+
+        pairs_for_profile: List[Tuple[str, int]] = []
+        for page_idx, txt in enumerate(pages[:2], start=1):
+            if not txt:
+                continue
+            for chunk in chunk_text(txt):
+                pairs_for_profile.append((chunk, page_idx))
+        profile_text = make_doc_profile(pairs_for_profile, document.filename)
+        document.profile = profile_text
         all_sec_texts.append(profile_text)
         all_sec_meta.append({
-            "text": profile_text, "page": 0, "doc_id": d["doc_id"],
-            "source": d["filename"], "kind": "section",
-            "section_id": f"__PROFILE__-{d['doc_id']}",
-            "section_title": "__PROFILE__"
+            "text": profile_text,
+            "page": 0,
+            "doc_id": document.doc_id,
+            "source": document.filename,
+            "kind": "section",
+            "section_id": f"__PROFILE__-{document.doc_id}",
+            "section_title": "__PROFILE__",
         })
 
-        # sections + chunks
+        section_rows: List[Section] = []
+        chunk_rows: List[Chunk] = []
         chunk_counter = 0
-        for s in secs:
-            # section record (title + leading snippet makes it more representative)
-            sec_repr = (s["section_title"] + "\n" + s["text"][:1000]).strip()
-            all_sec_texts.append(sec_repr)
+
+        for section in sections:
+            section_repr = (section["section_title"] + "\n" + section["text"][:1000]).strip()
+            all_sec_texts.append(section_repr)
             all_sec_meta.append({
-                "text": sec_repr,
-                "page": s["page_start"],
-                "doc_id": d["doc_id"],
-                "source": d["filename"],
+                "text": section_repr,
+                "page": section["page_start"],
+                "doc_id": document.doc_id,
+                "source": document.filename,
                 "kind": "section",
-                "section_id": s["section_id"],
-                "section_title": s["section_title"],
+                "section_id": section["section_id"],
+                "section_title": section["section_title"],
             })
 
-            # chunk within the section
-            for ch in chunk_text(s["text"]):
-                all_chunk_texts.append(ch)
+            section_rows.append(
+                Section(
+                    document_id=document.id,
+                    section_id=section["section_id"],
+                    section_title=section["section_title"],
+                    page_start=section["page_start"],
+                    page_end=section["page_end"],
+                    text=section["text"],
+                )
+            )
+
+            for chunk in chunk_text(section["text"]):
+                all_chunk_texts.append(chunk)
                 all_chunk_meta.append({
-                    "text": ch,
-                    "page": s["page_start"],
-                    "doc_id": d["doc_id"],
-                    "source": d["filename"],
+                    "text": chunk,
+                    "page": section["page_start"],
+                    "doc_id": document.doc_id,
+                    "source": document.filename,
                     "kind": "chunk",
-                    "section_id": s["section_id"],
-                    "section_title": s["section_title"],
+                    "section_id": section["section_id"],
+                    "section_title": section["section_title"],
                 })
+                chunk_rows.append(
+                    Chunk(
+                        document_id=document.id,
+                        section_id=section["section_id"],
+                        section_title=section["section_title"],
+                        page=section["page_start"],
+                        text=chunk,
+                    )
+                )
                 chunk_counter += 1
 
-        d["chunk_count"] = chunk_counter
+        document.chunk_count = chunk_counter
 
-    # build + persist dual indexes
+        db.execute(delete(Section).where(Section.document_id == document.id))
+        db.execute(delete(Chunk).where(Chunk.document_id == document.id))
+        for row in section_rows:
+            db.add(row)
+        for row in chunk_rows:
+            db.add(row)
+
     if not all_sec_texts or not all_chunk_texts:
+        db.commit()
+        logger.warning("Index build aborted: no text extracted from selected documents")
         raise HTTPException(status_code=400, detail="No text extracted from selected documents.")
 
-    # sections
     sec_embs = model.encode(all_sec_texts, batch_size=64, show_progress_bar=False, convert_to_numpy=True)
     sec_embs = normalize(sec_embs.astype(np.float32))
-    s_dim = sec_embs.shape[1]
-    s_idx = faiss.IndexFlatIP(s_dim)
-    s_idx.add(sec_embs)
+    sections_index = faiss.IndexFlatIP(sec_embs.shape[1])
+    sections_index.add(sec_embs)
 
-    # chunks
     chk_embs = model.encode(all_chunk_texts, batch_size=64, show_progress_bar=False, convert_to_numpy=True)
     chk_embs = normalize(chk_embs.astype(np.float32))
-    c_dim = chk_embs.shape[1]
-    c_idx = faiss.IndexFlatIP(c_dim)
-    c_idx.add(chk_embs)
+    chunks_index = faiss.IndexFlatIP(chk_embs.shape[1])
+    chunks_index.add(chk_embs)
 
-    # swap in-memory + save
-    global sections_index, sections_meta, chunks_index, chunks_meta, faiss_index, metadata
-    sections_index, sections_meta = s_idx, all_sec_meta
-    chunks_index, chunks_meta = c_idx, all_chunk_meta
+    db.commit()
 
-    # keep your old flat index for fallback (optional)
-    faiss_index = c_idx
-    metadata = all_chunk_meta
+    store_state = StoreState(
+        faiss_index=chunks_index,
+        metadata=all_chunk_meta,
+        sections_index=sections_index,
+        sections_meta=all_sec_meta,
+        chunks_index=chunks_index,
+        chunks_meta=all_chunk_meta,
+    )
 
-    save_dual_stores(sections_index, sections_meta, chunks_index, chunks_meta)
-    save_docs(docs_registry)
+    with store_cache_lock:
+        store_cache[current_user.id] = store_state
+    persist_user_store(current_user.id, store_state)
 
-    return {"status": "indexed", "docs_indexed": len(chosen),
-            "sections": len(all_sec_meta), "total_chunks": len(all_chunk_meta)}
+    logger.info(
+        "Index build complete: sections=%d chunks=%d",
+        len(all_sec_meta),
+        len(all_chunk_meta),
+    )
 
+    return {
+        "status": "indexed",
+        "docs_indexed": len(documents),
+        "sections": len(all_sec_meta),
+        "total_chunks": len(all_chunk_meta),
+    }
 
 @app.delete("/docs/{doc_id}")
-def delete_doc(doc_id: str):
-    global docs_registry
-    before = len(docs_registry)
-    docs_registry = [d for d in docs_registry if d["doc_id"] != doc_id]
-    save_docs(docs_registry)
-    return {"status": "deleted", "removed": before - len(docs_registry)}
+def delete_doc(
+    doc_id: str,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    document = db.execute(select(Document).where(Document.doc_id == doc_id)).scalar_one_or_none()
+    if document is None:
+        logger.warning("Delete requested for unknown document %s", doc_id)
+        return {"status": "deleted", "removed": 0}
+
+    if document.owner_id not in (current_user.id, None) and current_user.role != "admin":
+        raise HTTPException(status_code=403, detail="You cannot delete this document.")
+
+    db.execute(delete(Section).where(Section.document_id == document.id))
+    db.execute(delete(Chunk).where(Chunk.document_id == document.id))
+    db.delete(document)
+    db.commit()
+
+    try:
+        path = Path(document.path)
+        if path.exists():
+            path.unlink()
+    except OSError:
+        logger.warning("Failed to remove file for deleted document %s", doc_id)
+
+    clear_user_store(current_user.id)
+    logger.info("Deleted document %s for user %s", doc_id, current_user.email)
+    return {"status": "deleted", "removed": 1}
 
 @app.post("/chat")
-async def chat(req: ChatRequest):
-    global faiss_index, metadata, docs_registry
-    if faiss_index is None or not metadata:
-        raise HTTPException(status_code=503, detail="Index not ready. Add files and click 'Build Index'.")
-
+async def chat(
+    req: ChatRequest,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
     question = (req.message or "").strip()
     if not question:
         raise HTTPException(status_code=400, detail="Message is empty.")
 
+    docs = get_accessible_documents(db, current_user, doc_ids=req.doc_ids if req.doc_ids else None)
+    if not docs:
+        raise HTTPException(status_code=400, detail="No accessible documents selected.")
+    doc_lookup = {doc.doc_id: doc for doc in docs}
+
+    store = ensure_store_for_user(current_user.id)
+
+    allowed_ids = req.doc_ids if req.doc_ids else list(doc_lookup.keys())
+    preview = (question[:80] + ("..." if len(question) > 80 else "")).replace("\n", " ")
+    logger.info(
+        "Chat request received (docs=%s, preview=%s)",
+        allowed_ids if allowed_ids else "all",
+        preview,
+    )
+
     try:
-        allowed = req.doc_ids if req.doc_ids else None
-
-        # retrieve passages
-        hits = retrieve_hierarchical(question, allowed_doc_ids=allowed)
+        hits = retrieve_hierarchical(store, question, allowed_doc_ids=allowed_ids)
         if not hits:
-            # fallback to flat if section-aware has no signal
-            hits = retrieve(question, k=TOP_K, allowed_doc_ids=allowed)
-        
-        # profile-first logic
-        should_add_profile = False
-        q_low = question.lower()
-        if allowed and len(allowed) == 1:
-            should_add_profile = True
-        elif any(t in q_low for t in OVERVIEW_TRIGGERS):
-            should_add_profile = True
+            hits = retrieve(store, question, k=TOP_K, allowed_doc_ids=allowed_ids)
+    except HTTPException:
+        raise
+    except urllib.error.URLError as exc:
+        logger.error("Ollama not reachable at %s: %s", MODEL_BASE_URL, exc)
+        raise HTTPException(status_code=503, detail=f"Ollama not reachable at {MODEL_BASE_URL}: {exc}")
+    except Exception as exc:
+        logger.exception("Error during retrieval")
+        raise HTTPException(status_code=500, detail=f"Retrieval error: {exc}")
 
-        if should_add_profile:
-            # choose which doc's profile to include
-            if allowed and len(allowed) == 1:
-                target_doc = allowed[0]
-            else:
-                # doc with most hits
-                doc_counts = {}
-                for h in hits:
-                    doc_counts[h["doc_id"]] = doc_counts.get(h["doc_id"], 0) + 1
-                target_doc = max(doc_counts, key=doc_counts.get)
+    should_add_profile = False
+    q_low = question.lower()
+    if req.doc_ids and len(req.doc_ids) == 1:
+        should_add_profile = True
+    elif any(trigger in q_low for trigger in OVERVIEW_TRIGGERS):
+        should_add_profile = True
 
-            prof_text = None
-            prof_filename = None
-            for d in docs_registry:
-                if d["doc_id"] == target_doc and d.get("profile"):
-                    prof_text = d["profile"]
-                    prof_filename = d["filename"]
-                    break
+    if should_add_profile and hits:
+        if req.doc_ids and len(req.doc_ids) == 1:
+            target_doc_id = req.doc_ids[0]
+        else:
+            doc_counts: Dict[str, int] = {}
+            for hit in hits:
+                doc_counts[hit["doc_id"]] = doc_counts.get(hit["doc_id"], 0) + 1
+            target_doc_id = max(doc_counts, key=doc_counts.get)
+        doc = doc_lookup.get(target_doc_id)
+        if doc and doc.profile:
+            if not any(h.get("kind") == "profile" and h["doc_id"] == target_doc_id for h in hits):
+                hits = [
+                    {
+                        "text": doc.profile,
+                        "page": 0,
+                        "doc_id": target_doc_id,
+                        "source": doc.filename,
+                        "kind": "profile",
+                    }
+                ] + hits
 
-            if prof_text:
-                # prepend profile if not already in hits
-                if not any(h.get("kind") == "profile" and h["doc_id"] == target_doc for h in hits):
-                    hits = [{
-                        "text": prof_text, "page": 0, "doc_id": target_doc,
-                        "source": prof_filename or "profile", "kind": "profile"
-                    }] + hits
-
-        # debug
-        print("RETRIEVED:", [
-            (h.get("source"), h.get("page"), h.get("kind", "chunk"),
-             (h["text"][:80] + "...") if len(h["text"]) > 80 else h["text"])
-            for h in hits
-        ])
-
-        # prompt
-        context_texts = [h["text"] for h in hits]
-        prompt = render_prompt(context_texts, question)
-
-        # generation (slightly larger budget for overviews)
-        max_tokens = MAX_NEW_TOKENS
-        if should_add_profile:
-            max_tokens = max(max_tokens, 220)
-
-        raw = ollama_generate(prompt, max_tokens=max_tokens, temperature=TEMPERATURE)
-        answer = postprocess_answer(raw)
-        return {
-            "response": answer,
-            "sources": [
-                {"doc_id": h["doc_id"], "page": h["page"], "source": h["source"]}
+    if logger.isEnabledFor(logging.DEBUG):
+        logger.debug(
+            "Retrieved candidates: %s",
+            [
+                (
+                    h.get("source"),
+                    h.get("page"),
+                    h.get("kind", "chunk"),
+                    (h["text"][:80] + "...") if len(h["text"]) > 80 else h["text"],
+                )
                 for h in hits
-            ]
-        }
+            ],
+        )
 
-    except urllib.error.URLError as e:
-        raise HTTPException(status_code=503, detail=f"Ollama not reachable at {MODEL_BASE_URL}: {e}")
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Error during chat: {e}")
+    context_texts = [h["text"] for h in hits]
+    prompt = render_prompt(context_texts, question)
+    max_tokens = MAX_NEW_TOKENS
+    if should_add_profile:
+        max_tokens = max(max_tokens, 220)
+
+    raw = ollama_generate(prompt, max_tokens=max_tokens, temperature=TEMPERATURE)
+    answer = postprocess_answer(raw)
+    logger.info("Chat response generated (%d source chunks)", len(hits))
+
+    session: Optional[ChatSession] = None
+    session_id = req.session_id
+    if session_id:
+        session = db.execute(
+            select(ChatSession).where(
+                ChatSession.session_id == session_id,
+                ChatSession.user_id == current_user.id,
+            )
+        ).scalar_one_or_none()
+    if session is None:
+        session_id = session_id or uuid.uuid4().hex[:12]
+        session = ChatSession(
+            session_id=session_id,
+            user_id=current_user.id,
+            title=(question[:80] or "New chat"),
+        )
+        db.add(session)
+        db.flush()
+
+    user_message = ChatMessage(
+        session_id=session.id,
+        role="user",
+        content=question,
+        sources=None,
+    )
+    assistant_message = ChatMessage(
+        session_id=session.id,
+        role="assistant",
+        content=answer,
+        sources=json.dumps([
+            {"doc_id": h["doc_id"], "page": h["page"], "source": h["source"]}
+            for h in hits
+        ]),
+    )
+    db.add_all([user_message, assistant_message])
+    db.commit()
+
+    return {
+        "response": answer,
+        "sources": [
+            {"doc_id": h["doc_id"], "page": h["page"], "source": h["source"]}
+            for h in hits
+        ],
+        "session_id": session.session_id,
+    }
 
 @app.get("/docs")
-def list_docs():
-    return {"docs": docs_registry, "total_docs": len(docs_registry)}
-
-# =========================
-# Startup: load persisted index + registry
-# =========================
-@app.on_event("startup")
-def _try_load_store():
-    global faiss_index, metadata, docs_registry
-    idx, meta = load_store()
-    dual = load_dual_stores()
-    if dual is not None:
-        global sections_index, sections_meta, chunks_index, chunks_meta
-        sections_index, sections_meta, chunks_index, chunks_meta = dual
-    if idx is not None and meta is not None:
-        faiss_index, metadata = idx, meta
-    docs_registry = load_docs()
+def list_docs(
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    documents = get_accessible_documents(db, current_user)
+    return {
+        "docs": [serialize_document(doc) for doc in documents],
+        "total_docs": len(documents),
+    }

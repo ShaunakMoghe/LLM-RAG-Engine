@@ -32,3 +32,14 @@ backend/.env.local
 Thumbs.db
 .vscode/
 .idea/
+backend/data.db
+backend/unsloth_compiled_cache/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+coverage.xml
+.coverage
+*.log
+npm-debug.log*
+yarn-error.log*
+.ipynb_checkpoints/
